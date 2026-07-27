@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import dotenv from "dotenv";
 import Stripe from "stripe";
 import Order from "./models/Order.js";
+import Product from "./models/Product.js";
 
 dotenv.config();
 
@@ -13,15 +14,18 @@ const PORT = process.env.PORT || 5000;
 // ============ STRIPE INITIALIZATION ============
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// ============ ALLOWED ORIGINS (used for CORS and Stripe redirect validation) ============
+const ALLOWED_ORIGINS = [
+  "https://lambent-marshmallow-d41308.netlify.app",
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:5175",
+];
+
 // ============ MIDDLEWARE ============
 app.use(
   cors({
-    origin: [
-      "https://lambent-marshmallow-d41308.netlify.app",
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://localhost:5175",
-    ],
+    origin: ALLOWED_ORIGINS,
     credentials: true,
   }),
 );
@@ -151,7 +155,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
   try {
     console.log("📦 Full Request Body:", JSON.stringify(req.body, null, 2));
 
-    const { items, customer } = req.body;
+    const { items, customer, origin } = req.body;
 
     // Check if items exist
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -169,11 +173,13 @@ app.post("/api/create-checkout-session", async (req, res) => {
       });
     }
 
-    // ✅ Dynamic BASE URL - Production aur Development ke liye
-    const BASE_URL =
-      process.env.NODE_ENV === "production"
-        ? "https://lambent-marshmallow-d41308.netlify.app"
-        : process.env.BASE_URL || "http://localhost:5173";
+    // ✅ Use the origin the request actually came from (validated against the
+    // allowlist) so Stripe redirects back to localhost during local testing
+    // and to the live domain in production — instead of always using one or
+    // the other based on NODE_ENV.
+    const BASE_URL = ALLOWED_ORIGINS.includes(origin)
+      ? origin
+      : ALLOWED_ORIGINS[0];
 
     console.log(`🌐 Using BASE_URL: ${BASE_URL}`);
 
@@ -270,6 +276,130 @@ app.post("/api/admin/login", (req, res) => {
     success: false,
     error: "Invalid credentials",
   });
+});
+
+// ============ PRODUCT ROUTES ============
+
+// GET all products (public — used by the menu/homepage)
+app.get("/api/products", async (req, res) => {
+  try {
+    // Only return active products to the public site, sorted by display order
+    const products = await Product.find({ isActive: true }).sort({
+      order: 1,
+      createdAt: 1,
+    });
+    res.json({ success: true, products });
+  } catch (err) {
+    console.error("Error fetching products:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET all products including inactive ones (for admin panel)
+app.get("/api/admin/products", async (req, res) => {
+  try {
+    const products = await Product.find().sort({ order: 1, createdAt: 1 });
+    res.json({ success: true, products });
+  } catch (err) {
+    console.error("Error fetching products:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET single product
+app.get("/api/products/:id", async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (!product) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Product not found" });
+    }
+    res.json({ success: true, product });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST create new product (admin)
+app.post("/api/products", async (req, res) => {
+  try {
+    const { name, tagline, price, img, tag, bgColor, order, isActive } =
+      req.body;
+
+    if (!name || !price || !img) {
+      return res.status(400).json({
+        success: false,
+        error: "Name, price, and image are required",
+      });
+    }
+
+    const newProduct = new Product({
+      name,
+      tagline: tagline || "",
+      price,
+      img,
+      tag: tag || "",
+      bgColor: bgColor || "#ee2b1e",
+      order: order ?? 0,
+      isActive: isActive ?? true,
+    });
+
+    await newProduct.save();
+
+    console.log(`✅ New product created: ${newProduct.name}`);
+
+    res.status(201).json({ success: true, product: newProduct });
+  } catch (err) {
+    console.error("Error creating product:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PUT update product (admin)
+app.put("/api/products/:id", async (req, res) => {
+  try {
+    const { name, tagline, price, img, tag, bgColor, order, isActive } =
+      req.body;
+
+    const product = await Product.findByIdAndUpdate(
+      req.params.id,
+      { name, tagline, price, img, tag, bgColor, order, isActive },
+      { new: true, runValidators: true },
+    );
+
+    if (!product) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Product not found" });
+    }
+
+    console.log(`📝 Product updated: ${product.name}`);
+
+    res.json({ success: true, product });
+  } catch (err) {
+    console.error("Error updating product:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE product (admin)
+app.delete("/api/products/:id", async (req, res) => {
+  try {
+    const product = await Product.findByIdAndDelete(req.params.id);
+
+    if (!product) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Product not found" });
+    }
+
+    console.log(`🗑️  Product deleted: ${product.name}`);
+
+    res.json({ success: true, message: "Product deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ============ ORDER ROUTES ============
