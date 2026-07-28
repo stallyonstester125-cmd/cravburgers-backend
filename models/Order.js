@@ -28,7 +28,9 @@ const orderSchema = new mongoose.Schema(
     },
     items: [
       {
-        id: Number,
+        // Product ka MongoDB _id (string). Pehle Number tha, jis se DB se aane
+        // wale products ka order place hi nahi hota tha.
+        id: String,
         name: String,
         price: String,
         quantity: Number,
