@@ -11,6 +11,13 @@ import User from "./models/User.js";
 
 dotenv.config();
 
+if (!process.env.JWT_SECRET) {
+  console.error(
+    "❌ JWT_SECRET is not set. Add it to .env (local) or to your host's environment variables.",
+  );
+  process.exit(1);
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -56,6 +63,33 @@ function authMiddleware(req, res, next) {
       .status(401)
       .json({ success: false, error: "Invalid or expired token" });
   }
+}
+
+// Token ho to req.user set karta hai, na ho to bhi request aage jaane deta hai.
+// Guest checkout isi wajah se chalta rehta hai.
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      req.user = jwt.verify(authHeader.split(" ")[1], process.env.JWT_SECRET);
+    } catch {
+      // Invalid/expired token — guest ki tarah treat karo, error mat do
+      req.user = null;
+    }
+  }
+  next();
+}
+
+// Sirf admin — orders aur products ke management routes ke liye
+function adminMiddleware(req, res, next) {
+  authMiddleware(req, res, () => {
+    if (req.user?.role !== "admin") {
+      return res
+        .status(403)
+        .json({ success: false, error: "Admin access required" });
+    }
+    next();
+  });
 }
 
 app.post(
@@ -107,7 +141,9 @@ app.post(
           customer_name,
           customer_phone,
           customer_address,
+          customer_email,
           customer_notes,
+          user_id,
         } = session.metadata;
 
         const lineItems = await stripe.checkout.sessions.listLineItems(
@@ -125,10 +161,12 @@ app.post(
         const newOrder = new Order({
           orderId: `CRAV-${Date.now()}`,
           stripeSessionId: session.id, // ✅ used for idempotency check above
+          user: user_id || null,
           customer: {
             name: customer_name,
             phone: customer_phone,
             address: customer_address,
+            email: customer_email || session.customer_details?.email || "",
           },
           items: items,
           payment: {
@@ -173,7 +211,7 @@ app.get("/", (req, res) => {
 });
 
 // ============ STRIPE CHECKOUT SESSION ============
-app.post("/api/create-checkout-session", async (req, res) => {
+app.post("/api/create-checkout-session", optionalAuth, async (req, res) => {
   try {
     console.log("📦 Full Request Body:", JSON.stringify(req.body, null, 2));
 
@@ -229,7 +267,10 @@ app.post("/api/create-checkout-session", async (req, res) => {
         customer_name: customer.name,
         customer_phone: customer.phone,
         customer_address: customer.address,
+        customer_email: customer.email || "",
         customer_notes: customer.notes || "",
+        // Logged-in ho to webhook order ko isi account se link kar dega
+        user_id: req.user?.id || "",
       },
       shipping_address_collection: {
         allowed_countries: ["US", "CA", "GB", "PK", "IN", "AE"],
@@ -286,12 +327,24 @@ app.post("/api/admin/login", (req, res) => {
     });
   }
 
+  if (!process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD) {
+    console.error("❌ ADMIN_USERNAME / ADMIN_PASSWORD env me set nahi hain");
+    return res
+      .status(500)
+      .json({ success: false, error: "Admin login not configured" });
+  }
+
   if (
     username === process.env.ADMIN_USERNAME &&
     password === process.env.ADMIN_PASSWORD
   ) {
     console.log(`🔐 Admin logged in`);
-    return res.json({ success: true });
+    // Admin ko bhi asli JWT do — pehle sirf frontend localStorage flag tha,
+    // is liye API bilkul khuli hui thi.
+    const token = jwt.sign({ id: "admin", role: "admin" }, process.env.JWT_SECRET, {
+      expiresIn: "12h",
+    });
+    return res.json({ success: true, token });
   }
 
   return res.status(401).json({
@@ -303,9 +356,47 @@ app.post("/api/admin/login", (req, res) => {
 // ============ USER AUTH ROUTES ============
 
 // Register (signup)
+// User object ka wo shape jo frontend ko bhejna safe hai (password kabhi nahi)
+function publicUser(user) {
+  return {
+    id: user._id,
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    address: user.address,
+    city: user.city,
+    role: user.role,
+  };
+}
+
+// Account banne/login hone se pehle jo guest orders isi email/phone se aaye thay,
+// unhe is account se jod do — taake dashboard me purani history bhi dikhe.
+async function linkGuestOrders(user) {
+  // Guest ne email jis case me likhi thi wo waise hi save hui hai
+  // ("Ali@X.com"), is liye case-insensitive match karo
+  const escaped = user.email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = [{ "customer.email": new RegExp(`^${escaped}$`, "i") }];
+  if (user.phone) match.push({ "customer.phone": user.phone });
+
+  try {
+    const result = await Order.updateMany(
+      { user: null, $or: match },
+      { $set: { user: user._id } },
+    );
+    if (result.modifiedCount > 0) {
+      console.log(
+        `🔗 ${result.modifiedCount} guest order(s) linked to ${user.email}`,
+      );
+    }
+  } catch (err) {
+    // Linking fail ho to login/register nahi rukna chahiye
+    console.error("Guest order linking failed:", err.message);
+  }
+}
+
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { name, email, password, phone } = req.body;
+    const { name, email, password, phone, address, city } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({
@@ -335,28 +426,26 @@ app.post("/api/auth/register", async (req, res) => {
       email: email.toLowerCase(),
       password: hashedPassword,
       phone: phone || "",
+      address: address || "",
+      city: city || "",
       role: "user",
     });
-    await user.save();
-
+    // Token pehle banao — agar JWT_SECRET missing hai to adhoora account na bane
     const token = jwt.sign(
       { id: user._id, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
     );
 
+    await user.save();
+    await linkGuestOrders(user);
+
     console.log(`👤 New user registered: ${user.email}`);
 
     res.status(201).json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-      },
+      user: publicUser(user),
     });
   } catch (err) {
     console.error("Register error:", err);
@@ -396,18 +485,14 @@ app.post("/api/auth/login", async (req, res) => {
       { expiresIn: "7d" },
     );
 
+    await linkGuestOrders(user);
+
     console.log(`🔓 User logged in: ${user.email}`);
 
     res.json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-      },
+      user: publicUser(user),
     });
   } catch (err) {
     console.error("Login error:", err);
@@ -422,7 +507,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
     if (!user) {
       return res.status(404).json({ success: false, error: "User not found" });
     }
-    res.json({ success: true, user });
+    res.json({ success: true, user: publicUser(user) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -446,7 +531,7 @@ app.get("/api/products", async (req, res) => {
 });
 
 // GET all products including inactive ones (for admin panel)
-app.get("/api/admin/products", async (req, res) => {
+app.get("/api/admin/products", adminMiddleware, async (req, res) => {
   try {
     const products = await Product.find().sort({ order: 1, createdAt: 1 });
     res.json({ success: true, products });
@@ -472,7 +557,7 @@ app.get("/api/products/:id", async (req, res) => {
 });
 
 // POST create new product (admin)
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", adminMiddleware, async (req, res) => {
   try {
     const { name, tagline, price, img, tag, bgColor, order, isActive } =
       req.body;
@@ -507,7 +592,7 @@ app.post("/api/products", async (req, res) => {
 });
 
 // PUT update product (admin)
-app.put("/api/products/:id", async (req, res) => {
+app.put("/api/products/:id", adminMiddleware, async (req, res) => {
   try {
     const { name, tagline, price, img, tag, bgColor, order, isActive } =
       req.body;
@@ -534,7 +619,7 @@ app.put("/api/products/:id", async (req, res) => {
 });
 
 // DELETE product (admin)
-app.delete("/api/products/:id", async (req, res) => {
+app.delete("/api/products/:id", adminMiddleware, async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
 
@@ -554,30 +639,49 @@ app.delete("/api/products/:id", async (req, res) => {
 
 // ============ ORDER ROUTES ============
 
-// GET all orders
-app.get("/api/orders", async (req, res) => {
+function formatOrder(o) {
+  return {
+    id: o.orderId,
+    customer: o.customer,
+    items: o.items,
+    payment: o.payment,
+    notes: o.notes,
+    total: o.total,
+    status: o.status,
+    createdAt: o.createdAt,
+    updatedAt: o.updatedAt,
+  };
+}
+
+// GET all orders (admin only — isme har customer ka naam, phone aur address hai)
+app.get("/api/orders", adminMiddleware, async (req, res) => {
   try {
     const orders = await Order.find().sort({ createdAt: -1 });
-    const formatted = orders.map((o) => ({
-      id: o.orderId,
-      customer: o.customer,
-      items: o.items,
-      payment: o.payment,
-      notes: o.notes,
-      total: o.total,
-      status: o.status,
-      createdAt: o.createdAt,
-      updatedAt: o.updatedAt,
-    }));
-    res.json({ success: true, orders: formatted });
+    res.json({ success: true, orders: orders.map(formatOrder) });
   } catch (err) {
     console.error("Error fetching orders:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// POST new order (COD)
-app.post("/api/orders", async (req, res) => {
+// GET logged-in user ke apne orders — user dashboard isay use karta hai.
+// NOTE: ye "/api/orders/:id" se PEHLE hona zaroori hai, warna "my" ko
+// order id samajh liya jayega.
+app.get("/api/orders/my", authMiddleware, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.user.id }).sort({
+      createdAt: -1,
+    });
+    res.json({ success: true, orders: orders.map(formatOrder) });
+  } catch (err) {
+    console.error("Error fetching user orders:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST new order (COD) — optionalAuth: guest bhi order kar sakta hai,
+// logged-in ho to order uske account se link ho jata hai
+app.post("/api/orders", optionalAuth, async (req, res) => {
   try {
     const { customer, items, payment, notes, total } = req.body;
 
@@ -597,6 +701,7 @@ app.post("/api/orders", async (req, res) => {
 
     const newOrder = new Order({
       orderId: `CRAV-${Date.now()}`,
+      user: req.user?.id || null,
       customer,
       items,
       payment: payment || { method: "COD", status: "pending" },
@@ -607,21 +712,25 @@ app.post("/api/orders", async (req, res) => {
 
     await newOrder.save();
 
-    console.log(`✅ New order received: ${newOrder.orderId}`);
+    // Logged-in user ka address yaad rakho — agli baar checkout prefill ho jayega
+    if (req.user?.id) {
+      await User.findByIdAndUpdate(req.user.id, {
+        address: customer.address,
+        city: customer.city || "",
+        ...(customer.phone ? { phone: customer.phone } : {}),
+      }).catch((err) =>
+        console.error("Profile address update failed:", err.message),
+      );
+    }
+
+    console.log(
+      `✅ New order received: ${newOrder.orderId}${req.user?.id ? " (user linked)" : " (guest)"}`,
+    );
 
     res.status(201).json({
       success: true,
       message: "Order placed successfully!",
-      order: {
-        id: newOrder.orderId,
-        customer: newOrder.customer,
-        items: newOrder.items,
-        payment: newOrder.payment,
-        notes: newOrder.notes,
-        total: newOrder.total,
-        status: newOrder.status,
-        createdAt: newOrder.createdAt,
-      },
+      order: formatOrder(newOrder),
     });
   } catch (err) {
     console.error("Error creating order:", err);
@@ -630,33 +739,33 @@ app.post("/api/orders", async (req, res) => {
 });
 
 // GET single order
-app.get("/api/orders/:id", async (req, res) => {
+app.get("/api/orders/:id", optionalAuth, async (req, res) => {
   try {
     const order = await Order.findOne({ orderId: req.params.id });
     if (!order) {
       return res.status(404).json({ success: false, error: "Order not found" });
     }
-    res.json({
-      success: true,
-      order: {
-        id: order.orderId,
-        customer: order.customer,
-        items: order.items,
-        payment: order.payment,
-        notes: order.notes,
-        total: order.total,
-        status: order.status,
-        createdAt: order.createdAt,
-        updatedAt: order.updatedAt,
-      },
-    });
+
+    // Agar order kisi account se linked hai to sirf wohi user (ya admin) dekh sake.
+    // Guest orders khule rehte hain — order-confirmation page ko chahiye hote hain.
+    if (order.user) {
+      const isOwner = req.user && String(order.user) === String(req.user.id);
+      const isAdmin = req.user?.role === "admin";
+      if (!isOwner && !isAdmin) {
+        return res
+          .status(403)
+          .json({ success: false, error: "Not allowed to view this order" });
+      }
+    }
+
+    res.json({ success: true, order: formatOrder(order) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// UPDATE order status
-app.patch("/api/orders/:id/status", async (req, res) => {
+// UPDATE order status (admin only)
+app.patch("/api/orders/:id/status", adminMiddleware, async (req, res) => {
   try {
     const { status } = req.body;
     const validStatuses = [
@@ -686,27 +795,14 @@ app.patch("/api/orders/:id/status", async (req, res) => {
 
     console.log(`📝 Order ${req.params.id} status updated to: ${status}`);
 
-    res.json({
-      success: true,
-      order: {
-        id: order.orderId,
-        customer: order.customer,
-        items: order.items,
-        payment: order.payment,
-        notes: order.notes,
-        total: order.total,
-        status: order.status,
-        createdAt: order.createdAt,
-        updatedAt: order.updatedAt,
-      },
-    });
+    res.json({ success: true, order: formatOrder(order) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// DELETE order
-app.delete("/api/orders/:id", async (req, res) => {
+// DELETE order (admin only)
+app.delete("/api/orders/:id", adminMiddleware, async (req, res) => {
   try {
     const order = await Order.findOneAndDelete({ orderId: req.params.id });
 

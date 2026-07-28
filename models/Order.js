@@ -12,6 +12,13 @@ const orderSchema = new mongoose.Schema(
       unique: true,
       sparse: true, // COD orders won't have this, sparse allows multiple nulls
     },
+    // Logged-in user ka order — guest orders me ye null rehta hai
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
     customer: {
       name: { type: String, required: true },
       phone: { type: String, required: true },
